@@ -210,8 +210,21 @@ async function resolvePivot({ conflict, itinerary, profile, mood }) {
 
 async function resolveDestination(cityName) {
   const geocoded = await geocodeDestination(cityName);
-  if (geocoded) return geocoded;
-  return findCity(cityName);
+  if (geocoded) {
+    // Ensure we always have a viewport — synthesize from location if missing
+    if (!geocoded.viewport && geocoded.location) {
+      geocoded.viewport = viewportFromCenter(geocoded.location, 20000);
+    }
+    console.log(`[DESTINATION] Geocoded "${cityName}" → ${geocoded.name} (${geocoded.location.latitude.toFixed(4)}, ${geocoded.location.longitude.toFixed(4)}) viewport: ${geocoded.viewport ? 'YES' : 'NO'}`);
+    return geocoded;
+  }
+  const found = await findCity(cityName);
+  // findCity returns normalizePlace which has no viewport — synthesize one
+  if (found.location && !found.viewport) {
+    found.viewport = viewportFromCenter(found.location, 20000);
+  }
+  console.log(`[DESTINATION] findCity "${cityName}" → ${found.name} (${found.location?.latitude?.toFixed(4)}, ${found.location?.longitude?.toFixed(4)}) viewport: ${found.viewport ? 'YES' : 'NO'}`);
+  return found;
 }
 
 async function geocodeDestination(cityName) {
@@ -258,23 +271,28 @@ async function findCity(cityName) {
 
 /**
  * Search for candidate places matching the user's interests inside the
- * destination city.  When a city is specified we use `locationRestriction`
- * (hard fence) so Google Places never returns results outside the city —
- * this is the fix for the Gurgaon→Delhi bug.
+ * destination city. Per Google Places docs, do NOT combine a location name
+ * in `textQuery` with `locationRestriction` — it causes "unexpected results".
+ * Instead, use a generic query + geographic restriction to keep results
+ * inside the destination viewport.  This works for ANY city on earth.
  */
 async function searchInterestCandidates(profile, city) {
+  const hasDestination = Boolean(profile.city && city?.viewport);
+
   const batches = await Promise.all(
     profile.interests.map((interest) => {
       const body = {
-        textQuery: profile.city ? `best ${interest} in ${profile.city}` : interest,
+        // Per Google docs: do NOT put city name in textQuery when using
+        // locationRestriction — it causes conflicts. Keep query generic
+        // and let the geographic fence do the filtering.
+        textQuery: hasDestination ? `best ${interest}` : (profile.city ? `best ${interest} in ${profile.city}` : interest),
         fieldMask:
           "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.types,places.googleMapsUri,places.currentOpeningHours,places.photos,places.addressComponents",
         maxResultCount: 20,
       };
 
-      // Use locationRestriction (hard boundary) when we have a destination city
-      // so Places API cannot return results from the user's current city.
-      if (profile.city && city?.viewport) {
+      if (hasDestination) {
+        // Hard geographic boundary — only returns places inside this rectangle
         body.locationRestriction = {
           rectangle: toRectangle(expandViewport(city.viewport, profile.cityRadiusMeters)),
         };
@@ -296,13 +314,21 @@ async function searchInterestCandidates(profile, city) {
   );
 
   const byId = new Map();
+  let totalRaw = 0;
+  let filteredOut = 0;
   for (const data of batches) {
     for (const place of data.places ?? []) {
+      totalRaw++;
       const normalized = normalizePlace(place);
-      if (profile.city && !isInRequestedArea(normalized, profile, city)) continue;
+      if (profile.city && !isInRequestedArea(normalized, profile, city)) {
+        filteredOut++;
+        continue;
+      }
       if ((normalized.rating ?? 0) >= profile.minRating) byId.set(normalized.place_id, normalized);
     }
   }
+
+  console.log(`[CANDIDATES] Raw: ${totalRaw}, Filtered out: ${filteredOut}, Passed: ${byId.size}, Need: ${profile.stopCount}`);
 
   const candidates = [...byId.values()];
   if (candidates.length < 2) {
@@ -928,16 +954,20 @@ function primaryType(place) {
 function isInRequestedArea(place, profile, city) {
   if (!place.location) return false;
 
-  // 1. If we have a viewport for the city, check geographic containment
-  if (city?.viewport && isInsideViewport(place.location, expandViewport(city.viewport, profile.cityRadiusMeters))) {
+  // 1. If we have a viewport, use STRICT geographic containment
+  if (city?.viewport) {
+    const inside = isInsideViewport(place.location, expandViewport(city.viewport, profile.cityRadiusMeters));
+    if (!inside) {
+      // Hard reject — place is geographically outside the destination city
+      return false;
+    }
     return true;
   }
 
-  // 2. If viewport exists but place is outside it, use text matching as fallback
-  //    (some places on the city edge may be just outside the viewport)
+  // 2. Fallback: distance-based check
   if (city?.location) {
     const distance = distanceMeters(city.location, place.location);
-    if (distance > profile.cityRadiusMeters * 1.5) return false;
+    if (distance > profile.cityRadiusMeters) return false;
   }
 
   // 3. Text-based matching with alias expansion

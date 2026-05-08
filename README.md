@@ -54,7 +54,7 @@ MoodSync applies hard constraints before proposing a fix:
 - **Accessibility** — WCAG 2.2 AA: skip-to-content link, focus-visible outlines, ARIA roles/labels/live regions, keyboard navigation (Escape to close modals), `prefers-reduced-motion` support, 44px touch targets
 - **Dynamic vibe slider** — High Energy ↔ Low Battery mood switching
 
-## Setup
+## Setup & Deployment
 
 Create a `.env` file (see `.env.example`):
 
@@ -74,7 +74,18 @@ Enable these APIs in Google Cloud Console:
 - Maps Embed API
 - Maps JavaScript API
 
-Use a separate browser key for `GOOGLE_MAPS_BROWSER_KEY`, restricted by HTTP referrer (e.g., `http://localhost:4173/*`) and limited to Maps JavaScript API only.
+Use a separate browser key for `GOOGLE_MAPS_BROWSER_KEY`, restricted by HTTP referrer (e.g., `http://localhost:4173/*` and your Cloud Run URL) and limited to Maps JavaScript API only.
+
+### Deploying to Google Cloud Run
+
+MoodSync is fully stateless and runs perfectly on Cloud Run:
+
+```bash
+gcloud run deploy moodsync --source . --region us-central1 --allow-unauthenticated \
+  --set-env-vars GOOGLE_MAPS_API_KEY=...,GEMINI_API_KEY=...,GOOGLE_MAPS_BROWSER_KEY=...
+```
+
+**CRITICAL AFTER DEPLOY**: You MUST go to your Google Cloud Console and add your new Cloud Run URL (e.g., `https://moodsync-*.a.run.app/*`) to the "Website Restrictions" list for your `GOOGLE_MAPS_BROWSER_KEY`. If you leave it as just `localhost`, the map will fail to load in production!
 
 ## Run
 
