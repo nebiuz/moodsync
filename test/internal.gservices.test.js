@@ -37,8 +37,10 @@ test("internal gservices endpoint is hidden by default", async () => {
   const res = makeRes();
   const url = new URL("http://localhost:4173/api/_internal/gservices");
 
-  await mod.handleApi(req, res, url);
-  assert.equal(res.statusCode, 404);
+  await assert.rejects(
+    () => mod.handleApi(req, res, url),
+    (err) => err?.status === 404,
+  );
 });
 
 test("internal gservices endpoint requires token + loopback", async () => {
@@ -55,8 +57,10 @@ test("internal gservices endpoint requires token + loopback", async () => {
     });
     const res = makeRes();
     const url = new URL("http://localhost:4173/api/_internal/gservices");
-    await mod.handleApi(req, res, url);
-    assert.equal(res.statusCode, 401);
+    await assert.rejects(
+      () => mod.handleApi(req, res, url),
+      (err) => err?.status === 401,
+    );
   }
 
   {
@@ -66,8 +70,10 @@ test("internal gservices endpoint requires token + loopback", async () => {
     });
     const res = makeRes();
     const url = new URL("http://localhost:4173/api/_internal/gservices");
-    await mod.handleApi(req, res, url);
-    assert.equal(res.statusCode, 403);
+    await assert.rejects(
+      () => mod.handleApi(req, res, url),
+      (err) => err?.status === 403,
+    );
   }
 
   {
