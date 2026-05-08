@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chooseBestAlternative } from "../src/services/decisionEngine.js";
+import { chooseBestAlternative, rankPlacesForPlan } from "../src/services/decisionEngine.js";
 
 const nearbyAlternatives = [
   {
@@ -83,4 +83,60 @@ test("returns no winner when every alternative violates hard constraints", () =>
   });
 
   assert.equal(decision.place_id, null);
+});
+
+test("traffic conflict still selects reachable alternatives", () => {
+  const decision = chooseBestAlternative({
+    alternatives: nearbyAlternatives,
+    conflict: { kind: "traffic", stopId: "museum1" },
+    mood: "high",
+  });
+
+  assert.ok(decision.place_id !== null);
+  assert.ok(decision.winner.transitMinutes <= 20);
+  assert.ok(decision.winner.rating >= 4.5);
+});
+
+test("explanation includes place name and transit time", () => {
+  const decision = chooseBestAlternative({
+    alternatives: nearbyAlternatives,
+    conflict: { kind: "rain", stopId: "park" },
+    mood: "high",
+  });
+
+  assert.ok(decision.explanation.includes(decision.winner.name));
+  assert.ok(decision.explanation.length > 20);
+});
+
+test("rankPlacesForPlan filters below min rating", () => {
+  const places = [
+    { place_id: "a", rating: 4.8, types: ["cafe"], localSignal: 0.8, openNow: true },
+    { place_id: "b", rating: 3.9, types: ["museum"], localSignal: 0.5, openNow: true },
+    { place_id: "c", rating: 4.6, types: ["park"], localSignal: 0.7, openNow: false },
+  ];
+
+  const ranked = rankPlacesForPlan({ places, profile: { minRating: 4.5, mood: "high" } });
+  assert.ok(ranked.every((p) => p.rating >= 4.5));
+  assert.equal(ranked.length, 2);
+});
+
+test("rankPlacesForPlan penalizes closed places", () => {
+  const places = [
+    { place_id: "open", rating: 4.5, types: ["cafe"], localSignal: 0.8, openNow: true },
+    { place_id: "closed", rating: 4.5, types: ["cafe"], localSignal: 0.8, openNow: false },
+  ];
+
+  const ranked = rankPlacesForPlan({ places, profile: { minRating: 4.0, mood: "high" } });
+  assert.equal(ranked[0].place_id, "open");
+});
+
+test("chooseBestAlternative returns explanation even with no winner", () => {
+  const decision = chooseBestAlternative({
+    alternatives: [],
+    conflict: { kind: "traffic", stopId: "stop1" },
+    mood: "high",
+  });
+
+  assert.equal(decision.place_id, null);
+  assert.ok(decision.explanation.length > 10);
 });

@@ -11,6 +11,27 @@ const port = Number(process.env.PORT ?? 4173);
 /** @type {string} Unique build ID for cache-busting share links */
 const BUILD_ID = Date.now().toString(36);
 
+/** Common city name aliases — user may type one, Google returns the other. */
+const CITY_ALIASES = {
+  bangalore: ["bengaluru", "bangalore"],
+  bengaluru: ["bangalore", "bengaluru"],
+  bombay: ["mumbai", "bombay"],
+  mumbai: ["bombay", "mumbai"],
+  madras: ["chennai", "madras"],
+  chennai: ["madras", "chennai"],
+  calcutta: ["kolkata", "calcutta"],
+  kolkata: ["calcutta", "kolkata"],
+  gurgaon: ["gurugram", "gurgaon"],
+  gurugram: ["gurgaon", "gurugram"],
+  delhi: ["new delhi", "delhi", "nai dilli"],
+  pune: ["poona", "pune"],
+  varanasi: ["banaras", "kashi", "varanasi"],
+  trivandrum: ["thiruvananthapuram", "trivandrum"],
+  pondicherry: ["puducherry", "pondicherry"],
+  cochin: ["kochi", "cochin"],
+  kochi: ["cochin", "kochi"],
+};
+
 const config = {
   googleMapsKey: process.env.GOOGLE_MAPS_API_KEY,
   googleMapsBrowserKey: process.env.GOOGLE_MAPS_BROWSER_KEY,
@@ -248,7 +269,7 @@ async function searchInterestCandidates(profile, city) {
         textQuery: profile.city ? `best ${interest} in ${profile.city}` : interest,
         fieldMask:
           "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.types,places.googleMapsUri,places.currentOpeningHours,places.photos,places.addressComponents",
-        maxResultCount: 12,
+        maxResultCount: 20,
       };
 
       // Use locationRestriction (hard boundary) when we have a destination city
@@ -293,13 +314,22 @@ async function searchInterestCandidates(profile, city) {
 }
 
 async function selectPlanWithGemini({ profile, city, candidates }) {
+  const cityLabel = profile.city || "the area";
   const prompt = {
     profile,
     currentUserLocation: profile.currentLocation,
+    destinationCity: cityLabel,
     city,
     candidates: candidates.map(compactPlace),
-    task:
-      "Choose an efficient same-day itinerary inside the requested city/area. Do not replace the requested destination with currentUserLocation; use currentUserLocation only to reason about the first hop. Respect tripStyle, avoid repeating the same type too often, and prefer variety. Return only JSON: {\"stops\":[{\"place_id\":\"...\",\"scheduled_time\":\"HH:MM\",\"rationale\":\"...\"}]}",
+    stopCount: profile.stopCount,
+    task: [
+      `You are a passionate local friend in ${cityLabel} planning a perfect day for a weekend explorer.`,
+      `Select EXACTLY ${profile.stopCount} stops from the candidates list. ALL stops MUST be inside ${cityLabel} — NEVER pick places from the user's home city.`,
+      `Trip style: "${profile.tripStyle}". Mood: "${profile.mood}".`,
+      `For each stop, write a 1–2 sentence "rationale" that feels like a local tip — explain WHY this place is special, what to order/see/do, and how it connects to the next stop. Avoid generic phrases like "matches constraints".`,
+      `Space stops ${Math.round(profile.totalHours / profile.stopCount * 60)} minutes apart starting at ${profile.startTime}. Vary the types: don't put two cafés or two museums back-to-back.`,
+      `Return ONLY JSON: {"stops":[{"place_id":"...","scheduled_time":"HH:MM","rationale":"..."}]}`,
+    ].join(" "),
   };
   const fallback = diversifyPlaces(
     rankPlacesForPlan({ places: rotateBySeed(candidates, profile.discoverySeed), profile }).sort(
@@ -309,8 +339,8 @@ async function selectPlanWithGemini({ profile, city, candidates }) {
     .slice(0, profile.stopCount)
     .map((place, index) => ({
       place_id: place.place_id,
-      scheduled_time: addHours(profile.startTime, index * 2),
-      rationale: "Selected because it matches rating, locality, and route-efficiency constraints.",
+      scheduled_time: addHours(profile.startTime, index * 1.5),
+      rationale: craftLocalTip(place, profile),
     }));
 
   const response = await geminiJson(prompt, { stops: fallback });
@@ -720,6 +750,7 @@ function normalizeProfile(input = {}) {
     currentLocation,
     cityRadiusMeters: clamp(Number(input.cityRadiusMeters ?? 20000), 5000, 60000),
     discoverySeed: Number(input.discoverySeed ?? 0),
+    totalHours: clamp(Number(input.stopCount ?? 4) * 1.5, 3, 18),
   };
 }
 
@@ -811,7 +842,7 @@ function normalizeViewport(viewport) {
 
 function requestedAreaTokens(inputCity, city) {
   const raw = `${inputCity} ${city?.name ?? ""} ${city?.address ?? ""}`.toLowerCase();
-  const tokens = raw
+  const baseTokens = raw
     .split(/[^a-z0-9]+/)
     .filter((token) => token.length > 2)
     .filter(
@@ -826,10 +857,20 @@ function requestedAreaTokens(inputCity, city) {
           "district",
           "province",
           "state",
+          "country",
+          "republic",
+          "kingdom",
         ].includes(token),
     );
 
-  return [...new Set(tokens)];
+  // Expand with known city aliases so "bangalore" also matches "bengaluru" and vice versa
+  const expanded = new Set(baseTokens);
+  for (const token of baseTokens) {
+    const aliases = CITY_ALIASES[token];
+    if (aliases) aliases.forEach((alias) => expanded.add(alias));
+  }
+
+  return [...expanded];
 }
 
 function normalizeTripStyle(style) {
@@ -887,18 +928,19 @@ function primaryType(place) {
 function isInRequestedArea(place, profile, city) {
   if (!place.location) return false;
 
+  // 1. If we have a viewport for the city, check geographic containment
   if (city?.viewport && isInsideViewport(place.location, expandViewport(city.viewport, profile.cityRadiusMeters))) {
     return true;
   }
 
-  if (city?.viewport) return false;
-
+  // 2. If viewport exists but place is outside it, use text matching as fallback
+  //    (some places on the city edge may be just outside the viewport)
   if (city?.location) {
     const distance = distanceMeters(city.location, place.location);
-    if (distance > profile.cityRadiusMeters) return false;
+    if (distance > profile.cityRadiusMeters * 1.5) return false;
   }
 
-  // FIX: construct placeText from the place's address, title, and address components
+  // 3. Text-based matching with alias expansion
   const placeText = [
     place.address ?? "",
     place.title ?? "",
@@ -1022,6 +1064,23 @@ function typesForConflict(conflict, profile) {
 function mapEmbedUrl(stops) {
   const query = stops.map((stop) => stop.title || stop.name).join(" to ");
   return `https://www.google.com/maps?q=${encodeURIComponent(query)}&output=embed`;
+}
+
+/** Generate a human-readable local tip for the fallback rationale. */
+function craftLocalTip(place, profile) {
+  const type = primaryType(place);
+  const rating = Number(place.rating || 0).toFixed(1);
+  const tips = {
+    cafe: `A ${rating}★ café the locals love — perfect for a slow start or a recharge between stops.`,
+    restaurant: `Rated ${rating}★ by locals. Great spot to fuel up for the rest of your ${profile.city || "day"} adventure.`,
+    museum: `One of the top-rated museums in ${profile.city || "the area"} at ${rating}★ — allocate at least an hour here.`,
+    art_gallery: `This ${rating}★ gallery is the kind of spot you'd miss without a local — worth the detour.`,
+    park: `${rating}★ green space, ideal for winding down or a quick walk between indoor stops.`,
+    shopping_mall: `Popular ${rating}★ shopping destination — great for gifts or just browsing.`,
+    tourist_attraction: `A ${rating}★ landmark that defines ${profile.city || "this area"} — don't skip it.`,
+    historical_landmark: `Rich history at ${rating}★ — one of those places that makes a trip feel meaningful.`,
+  };
+  return tips[type] || `Rated ${rating}★ by visitors — fits your ${profile.tripStyle} vibe perfectly.`;
 }
 
 /** Convert an expanded viewport to the rectangle format the Places API expects. */
