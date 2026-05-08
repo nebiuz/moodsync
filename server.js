@@ -104,6 +104,17 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (req.method === "GET" && url.pathname === "/api/_internal/gservices") {
+    assertInternalRequest(req);
+    sendJson(res, 200, {
+      provider: googleCloud.provider,
+      projectId: googleCloud.projectId,
+      serviceAccountEmail: googleCloud.serviceAccountEmail ?? null,
+      snapshot: googleCloud.getDebugSnapshot(),
+    });
+    return;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/place-photo") {
     requireKeys(["googleMapsKey"]);
     await proxyPlacePhoto(res, url);
@@ -158,7 +169,7 @@ async function createPlan(input) {
     forecast: matchForecastToStop(stop, forecast),
   }));
 
-  return {
+  const result = {
     profile,
     city,
     weather,
@@ -167,6 +178,18 @@ async function createPlan(input) {
     itinerary,
     mapUrl: mapEmbedUrl(stops),
   };
+
+  // Backend-only Google services integration (fake by default).
+  // This is deliberately non-blocking and never affects the user-visible response.
+  recordGoogleServicesTelemetry({
+    kind: "plan_created",
+    profile,
+    city,
+    itinerary: result.itinerary,
+    weather: result.weather,
+  });
+
+  return result;
 }
 
 async function pulseCheck({ itinerary, profile }) {
@@ -187,6 +210,15 @@ async function pulseCheck({ itinerary, profile }) {
     forecast: matchForecastToStop(stop, forecast),
   }));
   const conflicts = detectConflicts({ itinerary: updated, weather, profile: normalized });
+
+  recordGoogleServicesTelemetry({
+    kind: "pulse_checked",
+    profile: normalized,
+    city: normalized.city ? { name: normalized.city } : null,
+    itinerary: updated,
+    weather,
+    conflicts,
+  });
 
   return {
     weather,
@@ -216,6 +248,15 @@ async function resolvePivot({ conflict, itinerary, profile, mood }) {
   });
   const chosenId = decision.place_id ?? localDecision.place_id;
   const winner = alternatives.find((place) => place.place_id === chosenId) ?? localDecision.winner;
+
+  recordGoogleServicesTelemetry({
+    kind: "pivot_resolved",
+    profile: normalized,
+    city: normalized.city ? { name: normalized.city } : null,
+    conflict,
+    winner,
+    alternativesCount: alternatives.length,
+  });
 
   return {
     conflict,
@@ -1250,6 +1291,27 @@ function assertMethod(req, method) {
   if (req.method !== method) throw Object.assign(new Error("Method not allowed"), { status: 405 });
 }
 
+function assertInternalRequest(req) {
+  if (process.env.MOODSYNC_ENABLE_INTERNAL !== "1") {
+    throw Object.assign(new Error("Not found"), { status: 404 });
+  }
+
+  // Only allow local access (prevents accidental exposure on Cloud Run).
+  // If behind a proxy, enforce loopback in x-forwarded-for as well.
+  const remote = String(req.socket?.remoteAddress ?? "");
+  const fwd = String(req.headers["x-forwarded-for"] ?? "");
+  const isLoopback =
+    remote === "127.0.0.1" ||
+    remote === "::1" ||
+    remote.startsWith("::ffff:127.") ||
+    (fwd ? fwd.split(",")[0].trim().startsWith("127.") : false);
+  if (!isLoopback) throw Object.assign(new Error("Forbidden"), { status: 403 });
+
+  const token = String(req.headers["x-moodsync-internal-token"] ?? "");
+  const expected = String(process.env.MOODSYNC_INTERNAL_TOKEN ?? "");
+  if (!expected || token !== expected) throw Object.assign(new Error("Unauthorized"), { status: 401 });
+}
+
 function requireKeys(keys) {
   const missing = keys.filter((key) => !config[key]);
   if (missing.length) {
@@ -1269,6 +1331,56 @@ function badRequest(message) {
 function statusFor(error) {
   if (error.code === "ENOENT") return 404;
   return error.status ?? 500;
+}
+
+function recordGoogleServicesTelemetry(payload) {
+  try {
+    const now = new Date().toISOString();
+    const safe = JSON.parse(
+      JSON.stringify({
+        ...payload,
+        at: now,
+        buildId: BUILD_ID,
+        projectId: googleCloud.projectId,
+      }),
+    );
+
+    const docId = Math.random().toString(16).slice(2);
+    const doc = googleCloud.firestore.doc(`telemetry/${docId}`);
+
+    const publish = googleCloud.pubsub
+      .topic("moodsync.telemetry")
+      .publishJSON({ ...safe, docPath: doc.path }, { source: "server" });
+
+    const enqueue = googleCloud.tasks.queue("moodsync.telemetry").enqueue({
+      url: "https://example.invalid/internal/telemetry",
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: safe,
+      scheduleTime: null,
+    });
+
+    const log = googleCloud.logging.write({
+      severity: "INFO",
+      message: `telemetry:${safe.kind}`,
+      labels: { kind: safe.kind, buildId: BUILD_ID },
+    });
+
+    const storagePath = `telemetry/${safe.kind}/${docId}.json`;
+    const store = googleCloud.storage
+      .bucket("moodsync-audit")
+      .file(storagePath)
+      .save(JSON.stringify(safe), { contentType: "application/json", metadata: { kind: safe.kind } });
+
+    const analytics = googleCloud.analytics.logEvent(safe.kind, {
+      city: safe.city?.name ?? safe.profile?.city ?? null,
+      mood: safe.profile?.mood ?? null,
+    });
+
+    void Promise.allSettled([googleCloud.firestore.setDoc(doc, safe), publish, enqueue, store, log, analytics]);
+  } catch {
+    // Never let telemetry impact API responses.
+  }
 }
 
 async function loadDotEnv() {
