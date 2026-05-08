@@ -8,6 +8,9 @@ const root = fileURLToPath(new URL(".", import.meta.url));
 await loadDotEnv();
 const port = Number(process.env.PORT ?? 4173);
 
+/** @type {string} Unique build ID for cache-busting share links */
+const BUILD_ID = Date.now().toString(36);
+
 const config = {
   googleMapsKey: process.env.GOOGLE_MAPS_API_KEY,
   googleMapsBrowserKey: process.env.GOOGLE_MAPS_BROWSER_KEY,
@@ -24,6 +27,11 @@ const mime = {
 };
 
 createServer(async (req, res) => {
+  // Security headers on every response
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "SAMEORIGIN");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
@@ -81,6 +89,11 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (url.pathname === "/api/share") {
+    sendJson(res, 200, buildSharePayload(body));
+    return;
+  }
+
   sendJson(res, 404, { error: "API route not found" });
 }
 
@@ -91,16 +104,23 @@ async function createPlan(input) {
   const ranked = await selectPlanWithGemini({ profile, city, candidates });
   const stops = await hydrateSelectedStops({ selected: ranked, candidates, profile });
   const routes = await routeSegments(stops, profile);
-  const weather = await currentWeather(profile.currentLocation ?? city.location);
+  const weatherLocation = city?.location ?? profile.currentLocation;
+  const [weather, forecast] = await Promise.all([
+    currentWeather(weatherLocation),
+    forecastWeather(weatherLocation),
+  ]);
   const itinerary = attachRoutes(stops, routes).map((stop, index) => ({
     ...stop,
     insight: stop.insight ?? explainStop(stop, profile, routes[index]),
+    openNow: stop.openNow ?? null,
+    forecast: matchForecastToStop(stop, forecast),
   }));
 
   return {
     profile,
     city,
     weather,
+    forecast: (forecast ?? []).slice(0, 6),
     insights: tripInsights({ itinerary, weather, profile }),
     itinerary,
     mapUrl: mapEmbedUrl(stops),
@@ -114,15 +134,21 @@ async function pulseCheck({ itinerary, profile }) {
 
   const normalized = normalizeProfile(profile);
   const routes = await routeSegments(itinerary, normalized);
-  const weather = await currentWeather(itinerary[0].location);
+  const location = itinerary[0].location;
+  const [weather, forecast] = await Promise.all([
+    currentWeather(location),
+    forecastWeather(location),
+  ]);
   const updated = attachRoutes(itinerary, routes).map((stop, index) => ({
     ...stop,
     insight: explainStop(stop, normalized, routes[index]),
+    forecast: matchForecastToStop(stop, forecast),
   }));
   const conflicts = detectConflicts({ itinerary: updated, weather, profile: normalized });
 
   return {
     weather,
+    forecast: (forecast ?? []).slice(0, 6),
     itinerary: updated,
     conflicts,
     insights: tripInsights({ itinerary: updated, weather, profile: normalized }),
@@ -209,22 +235,31 @@ async function findCity(cityName) {
   return normalizePlace(place);
 }
 
+/**
+ * Search for candidate places matching the user's interests inside the
+ * destination city.  When a city is specified we use `locationRestriction`
+ * (hard fence) so Google Places never returns results outside the city —
+ * this is the fix for the Gurgaon→Delhi bug.
+ */
 async function searchInterestCandidates(profile, city) {
   const batches = await Promise.all(
     profile.interests.map((interest) => {
       const body = {
-        textQuery: profile.city ? `${interest} in ${profile.city}` : interest,
+        textQuery: profile.city ? `best ${interest} in ${profile.city}` : interest,
         fieldMask:
           "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.types,places.googleMapsUri,places.currentOpeningHours,places.photos,places.addressComponents",
         maxResultCount: 12,
       };
 
-      if (profile.city && city?.location) {
-        body.locationBias = {
-          circle: {
-            center: latLng(city.location),
-            radius: 18000,
-          },
+      // Use locationRestriction (hard boundary) when we have a destination city
+      // so Places API cannot return results from the user's current city.
+      if (profile.city && city?.viewport) {
+        body.locationRestriction = {
+          rectangle: toRectangle(expandViewport(city.viewport, profile.cityRadiusMeters)),
+        };
+      } else if (profile.city && city?.location) {
+        body.locationRestriction = {
+          rectangle: toRectangle(viewportFromCenter(city.location, profile.cityRadiusMeters)),
         };
       } else if (profile.currentLocation) {
         body.locationBias = {
@@ -444,17 +479,73 @@ async function routeSegments(stops, profileOrMode = "TRANSIT") {
 }
 
 async function currentWeather(location) {
-  const url = new URL("https://weather.googleapis.com/v1/currentConditions:lookup");
-  url.searchParams.set("key", config.googleMapsKey);
-  url.searchParams.set("location.latitude", String(location.latitude));
-  url.searchParams.set("location.longitude", String(location.longitude));
-  const data = await fetchJson(url);
-  return {
-    description: data.weatherCondition?.description?.text ?? "Current conditions unavailable",
-    precipitationProbability: data.precipitation?.probability?.percent ?? 0,
-    precipitationType: data.precipitation?.type ?? "NONE",
-    temperature: data.temperature,
-  };
+  try {
+    const url = new URL("https://weather.googleapis.com/v1/currentConditions:lookup");
+    url.searchParams.set("key", config.googleMapsKey);
+    url.searchParams.set("location.latitude", String(location.latitude));
+    url.searchParams.set("location.longitude", String(location.longitude));
+    const data = await fetchJson(url);
+    return {
+      description: data.weatherCondition?.description?.text ?? "Current conditions unavailable",
+      precipitationProbability: data.precipitation?.probability?.percent ?? 0,
+      precipitationType: data.precipitation?.type ?? "NONE",
+      temperature: data.temperature,
+    };
+  } catch {
+    return {
+      description: "Weather data unavailable",
+      precipitationProbability: 0,
+      precipitationType: "NONE",
+      temperature: null,
+    };
+  }
+}
+
+/**
+ * Fetch hourly weather forecast for the next 12 hours.
+ * Falls back gracefully if the forecast endpoint is unavailable.
+ */
+async function forecastWeather(location) {
+  try {
+    const url = new URL("https://weather.googleapis.com/v1/forecast/hours:lookup");
+    url.searchParams.set("key", config.googleMapsKey);
+    url.searchParams.set("location.latitude", String(location.latitude));
+    url.searchParams.set("location.longitude", String(location.longitude));
+    url.searchParams.set("hours", "12");
+    const data = await fetchJson(url);
+    return (data.forecastHours ?? []).map((hour) => ({
+      time: hour.interval?.startTime ?? null,
+      description: hour.weatherCondition?.description?.text ?? "",
+      precipitationProbability: hour.precipitation?.probability?.percent ?? 0,
+      temperature: hour.temperature,
+      icon: hour.weatherCondition?.type ?? "CLEAR",
+    }));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Match a forecast hour to a stop's scheduled time.
+ * Returns the closest forecast entry or null.
+ */
+function matchForecastToStop(stop, forecast) {
+  if (!forecast || !stop.time) return null;
+  const [h, m] = stop.time.split(":").map(Number);
+  const stopMinutes = h * 60 + (m || 0);
+  let best = null;
+  let bestDiff = Infinity;
+  for (const entry of forecast) {
+    if (!entry.time) continue;
+    const date = new Date(entry.time);
+    const entryMinutes = date.getHours() * 60 + date.getMinutes();
+    const diff = Math.abs(entryMinutes - stopMinutes);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = entry;
+    }
+  }
+  return best;
 }
 
 async function googlePost(url, body, { fieldMask }) {
@@ -522,11 +613,21 @@ function detectConflicts({ itinerary, weather, profile }) {
         message: `Route after ${stop.title} exceeds ${profile.maxTransitMinutes} minutes.`,
       });
     }
-    if (!stop.indoor && weather.precipitationProbability >= 40) {
+    // Check per-stop forecast first, then fall back to current weather
+    const rainProb = stop.forecast?.precipitationProbability ?? weather.precipitationProbability;
+    if (!stop.indoor && rainProb >= 40) {
       conflicts.push({
         kind: "rain",
         stopId: stop.id,
-        message: `${stop.title} is outdoors and rain probability is ${weather.precipitationProbability}%.`,
+        message: `${stop.title} is outdoors and rain probability is ${rainProb}% at ${stop.time || "scheduled time"}.`,
+      });
+    }
+    // Opening hours conflict
+    if (stop.openNow === false) {
+      conflicts.push({
+        kind: "closed",
+        stopId: stop.id,
+        message: `${stop.title} is currently closed.`,
       });
     }
   });
@@ -797,11 +898,17 @@ function isInRequestedArea(place, profile, city) {
     if (distance > profile.cityRadiusMeters) return false;
   }
 
-  const haystack = placeText;
+  // FIX: construct placeText from the place's address, title, and address components
+  const placeText = [
+    place.address ?? "",
+    place.title ?? "",
+    place.name ?? "",
+    ...(place.addressComponents ?? []),
+  ].join(" ").toLowerCase();
   const tokens = requestedAreaTokens(profile.city, city);
 
   if (!tokens.length) return true;
-  return tokens.some((token) => haystack.includes(token));
+  return tokens.some((token) => placeText.includes(token));
 }
 
 function expandViewport(viewport, radiusMeters) {
@@ -915,6 +1022,48 @@ function typesForConflict(conflict, profile) {
 function mapEmbedUrl(stops) {
   const query = stops.map((stop) => stop.title || stop.name).join(" to ");
   return `https://www.google.com/maps?q=${encodeURIComponent(query)}&output=embed`;
+}
+
+/** Convert an expanded viewport to the rectangle format the Places API expects. */
+function toRectangle(vp) {
+  return {
+    low: { latitude: vp.south, longitude: vp.west },
+    high: { latitude: vp.north, longitude: vp.east },
+  };
+}
+
+/** Synthesize a viewport from a center point + radius in meters. */
+function viewportFromCenter(location, radiusMeters) {
+  const km = radiusMeters / 1000;
+  const latPad = km / 111;
+  const lngPad = km / (111 * Math.max(0.2, Math.cos(toRadians(location.latitude))));
+  return {
+    north: location.latitude + latPad,
+    south: location.latitude - latPad,
+    east: location.longitude + lngPad,
+    west: location.longitude - lngPad,
+  };
+}
+
+/** Build a shareable trip summary payload. */
+function buildSharePayload({ itinerary, profile, weather }) {
+  if (!Array.isArray(itinerary) || !itinerary.length) {
+    throw badRequest("No itinerary to share.");
+  }
+  const stops = itinerary.map((stop, i) => ({
+    index: i + 1,
+    name: stop.title || stop.name,
+    time: stop.time,
+    rating: stop.rating,
+    address: stop.address,
+    mapsLink: stop.googleMapsUri || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(stop.address || stop.title)}`,
+  }));
+  const text = stops.map((s) => `${s.index}. ${s.time} — ${s.name} (${s.rating}★)\n   ${s.mapsLink}`).join("\n\n");
+  return {
+    title: `MoodSync trip: ${profile?.city || "My day"}`,
+    text: `🗺️ MoodSync Itinerary — ${profile?.city || "Today"}\n\n${text}\n\nWeather: ${weather?.description ?? "N/A"}`,
+    stops,
+  };
 }
 
 function addHours(time, hours) {

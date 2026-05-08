@@ -5,43 +5,59 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="MoodSync dynamically repairs a weekend travel itinerary when weather, traffic, or mood changes."
+      content="MoodSync dynamically repairs a weekend travel itinerary when weather, traffic, or mood changes. Built with Google Places, Routes, Weather, and Gemini."
     />
-    <title>MoodSync Travel Assistant</title>
+    <meta name="theme-color" content="#1c7c54" />
+    <title>MoodSync — Live Itinerary Rescue Assistant</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="./src/styles.css" />
   </head>
   <body>
+    <a class="sr-only sr-only-focusable" href="#main-content" id="skipLink">Skip to main content</a>
+
     <div class="app-shell">
-      <header class="topbar">
+      <header class="topbar" role="banner">
         <div>
           <p class="eyebrow">48-hour mood-aware city assistant</p>
           <h1>MoodSync</h1>
         </div>
-        <div class="status-pill" id="globalStatus">Pulse healthy</div>
+        <div class="topbar-actions">
+          <button
+            class="icon-btn"
+            id="darkModeToggle"
+            type="button"
+            aria-label="Toggle dark mode"
+            title="Toggle dark mode"
+          >🌙</button>
+          <div class="status-pill" id="globalStatus" role="status" aria-live="polite">Pulse healthy</div>
+        </div>
       </header>
 
-      <main class="workspace">
+      <main class="workspace" id="main-content">
         <section class="control-panel" aria-label="Trip controls">
           <div class="location-first">
-            <button class="primary" id="useLocationBtn" type="button">Use my location</button>
+            <button class="primary" id="useLocationBtn" type="button">📍 Use my location</button>
             <p id="locationHint">Start by sharing your location so MoodSync can pin you on the map and plan the first hop.</p>
           </div>
 
-          <form class="trip-form" id="tripForm">
-            <label>
+          <form class="trip-form" id="tripForm" aria-label="Trip configuration">
+            <label for="cityInput">
               Destination city or area
-              <input id="cityInput" name="city" placeholder="Paris, France" />
+              <input id="cityInput" name="city" placeholder="Delhi, Mumbai, Paris..." autocomplete="off" />
             </label>
-            <label>
+            <label for="interestsInput">
               What do you want to do?
               <input
                 id="interestsInput"
                 name="interests"
                 required
                 placeholder="coffee, museums, street food, markets"
+                aria-required="true"
               />
             </label>
-            <label>
+            <label for="tripStyleInput">
               Trip vibe
               <select id="tripStyleInput" name="tripStyle">
                 <option value="balanced">Balanced day</option>
@@ -52,17 +68,17 @@
               </select>
             </label>
             <div class="form-grid">
-              <label>
+              <label for="startTimeInput">
                 Start time
                 <input id="startTimeInput" name="startTime" type="time" value="10:00" />
               </label>
-              <label>
+              <label for="stopCountInput">
                 Places to visit
                 <input id="stopCountInput" name="stopCount" type="number" min="2" max="12" value="4" />
               </label>
             </div>
             <div class="form-grid">
-              <label>
+              <label for="maxTransitInput">
                 Max travel time
                 <input
                   id="maxTransitInput"
@@ -74,7 +90,7 @@
                 />
                 <span class="field-help">Minutes allowed between two stops.</span>
               </label>
-              <label>
+              <label for="minRatingInput">
                 Minimum rating
                 <input
                   id="minRatingInput"
@@ -83,11 +99,11 @@
                   min="0"
                   max="5"
                   step="0.1"
-                  value="4.5"
+                  value="4.2"
                 />
               </label>
             </div>
-            <label>
+            <label for="cityRadiusInput">
               Search area
               <select id="cityRadiusInput" name="cityRadiusMeters">
                 <option value="12000">City core only</option>
@@ -95,7 +111,7 @@
                 <option value="35000">Wider metro area</option>
               </select>
             </label>
-            <label>
+            <label for="travelModeInput">
               How will you travel?
               <select id="travelModeInput" name="travelMode">
                 <option value="TRANSIT">Transit</option>
@@ -104,11 +120,11 @@
                 <option value="BICYCLE">Bicycle</option>
               </select>
             </label>
-            <button class="primary" type="submit">Build live itinerary</button>
-            <button id="refreshIdeas" type="button">Refresh ideas</button>
+            <button class="primary" type="submit" id="buildBtn">🚀 Build live itinerary</button>
+            <button id="refreshIdeas" type="button">🔄 Refresh ideas</button>
           </form>
 
-          <div class="trip-context">
+          <div class="trip-context" aria-label="Trip context summary">
             <div>
               <span class="label">Location</span>
               <strong id="locationText">Not shared yet</strong>
@@ -123,13 +139,17 @@
             </div>
           </div>
 
-          <div class="mood-switch" role="group" aria-label="Energy mode">
-            <button class="mood-option active" id="highEnergyBtn" type="button">High Energy</button>
-            <button class="mood-option" id="lowBatteryBtn" type="button">Low Battery</button>
+          <div class="mood-switch" role="radiogroup" aria-label="Energy mode">
+            <button class="mood-option active" id="highEnergyBtn" type="button" role="radio" aria-checked="true">⚡ High Energy</button>
+            <button class="mood-option" id="lowBatteryBtn" type="button" role="radio" aria-checked="false">🔋 Low Battery</button>
           </div>
 
-          <div class="demo-controls" aria-label="Demo triggers">
-            <button id="pulseNow" type="button">Pulse check now</button>
+          <div class="demo-controls" aria-label="Trip actions">
+            <button id="pulseNow" type="button">🩺 Pulse check now</button>
+            <div class="action-row">
+              <button id="shareTrip" type="button" disabled>📤 Share trip</button>
+              <button id="exportTrip" type="button" disabled>📋 Export</button>
+            </div>
             <button id="resetTrip" type="button">Reset</button>
           </div>
         </section>
@@ -142,7 +162,7 @@
             </div>
             <span id="pulseStamp">Routes, weather, and places use live APIs</span>
           </div>
-          <div class="timeline" id="timeline"></div>
+          <div class="timeline" id="timeline" role="feed" aria-label="Itinerary stops"></div>
         </section>
 
         <section class="map-section" aria-label="Route preview">
@@ -156,22 +176,22 @@
             ></iframe>
             <div class="map-canvas" id="mapCanvas" aria-label="Recommended places map"></div>
           </div>
-          <div class="assistant-log" id="assistantLog" aria-live="polite">
-            Monitoring route pressure, weather fit, and Alex's energy mode.
+          <div class="assistant-log" id="assistantLog" aria-live="polite" role="log">
+            Monitoring route pressure, weather fit, and energy mode.
           </div>
         </section>
       </main>
     </div>
 
-    <section class="pivot-sheet" id="pivotSheet" aria-live="assertive" aria-hidden="true">
+    <section class="pivot-sheet" id="pivotSheet" aria-live="assertive" aria-hidden="true" role="dialog" aria-label="Pivot suggestion">
       <div class="sheet-grip"></div>
       <p class="eyebrow" id="pivotReason">MoodSync resolution</p>
       <h2 id="pivotTitle">Finding a better stop</h2>
-      <p id="pivotCopy">Analyzing nearby options against Alex's constraints.</p>
+      <p id="pivotCopy">Analyzing nearby options against your constraints.</p>
       <div class="candidate-list" id="candidateList"></div>
       <div class="sheet-actions">
         <button id="dismissPivot" type="button">Keep plan</button>
-        <button class="primary" id="acceptPivot" type="button">Update plan</button>
+        <button class="primary" id="acceptPivot" type="button">✅ Update plan</button>
       </div>
     </section>
 
