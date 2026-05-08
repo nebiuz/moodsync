@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chooseBestAlternative, rankPlacesForPlan } from "./src/services/decisionEngine.js";
+import { initGoogleCloud } from "./src/services/googleCloud/index.js";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 await loadDotEnv();
@@ -10,6 +11,13 @@ const port = Number(process.env.PORT ?? 4173);
 
 /** @type {string} Unique build ID for cache-busting share links */
 const BUILD_ID = Date.now().toString(36);
+
+/** Firebase/Google Cloud facade (fake by default). */
+const googleCloud = initGoogleCloud({
+  projectId: process.env.GOOGLE_CLOUD_PROJECT ?? process.env.FIREBASE_PROJECT_ID ?? "moodsync-local",
+  serviceAccountEmail: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL ?? null,
+  useReal: process.env.GOOGLE_CLOUD_USE_REAL === "1",
+});
 
 /** Common city name aliases — user may type one, Google returns the other. */
 const CITY_ALIASES = {
@@ -47,7 +55,8 @@ const mime = {
   ".md": "text/markdown; charset=utf-8",
 };
 
-createServer(async (req, res) => {
+if (process.env.MOODSYNC_DISABLE_SERVER !== "1") {
+  createServer(async (req, res) => {
   // Security headers on every response
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "SAMEORIGIN");
@@ -65,9 +74,10 @@ createServer(async (req, res) => {
   } catch (error) {
     sendJson(res, statusFor(error), { error: error.message ?? "Unexpected server error" });
   }
-}).listen(port, "0.0.0.0", () => {
+  }).listen(port, "0.0.0.0", () => {
   console.log(`MoodSync server running at http://127.0.0.1:${port}`);
-});
+  });
+}
 
 async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/config") {
@@ -78,7 +88,18 @@ async function handleApi(req, res, url) {
         !config.googleMapsKey && "GOOGLE_MAPS_API_KEY",
         !config.geminiKey && "GEMINI_API_KEY",
       ].filter(Boolean),
-      services: ["Google Geocoding", "Google Places", "Google Routes", "Google Weather", "Gemini"],
+      services: [
+        "Google Geocoding",
+        "Google Places",
+        "Google Routes",
+        "Google Weather",
+        "Gemini",
+        "Firebase (facade)",
+      ],
+      googleCloud: {
+        provider: googleCloud.provider,
+        projectId: googleCloud.projectId,
+      },
     });
     return;
   }
@@ -261,7 +282,7 @@ async function findCity(cityName) {
   const data = await placesTextSearch({
     textQuery: cityName,
     fieldMask:
-      "places.id,places.displayName,places.formattedAddress,places.location,places.addressComponents",
+      "places.id,places.displayName,places.formattedAddress,places.location,places.viewport,places.addressComponents",
     maxResultCount: 1,
   });
   const place = data.places?.[0];
@@ -292,9 +313,10 @@ async function searchInterestCandidates(profile, city) {
       };
 
       if (hasDestination) {
-        // Hard geographic boundary — only returns places inside this rectangle
+        // Hard geographic boundary — only returns places inside this rectangle.
+        // We use the EXACT viewport returned by Geocoding (no padding) so we don't bleed into neighboring cities!
         body.locationRestriction = {
-          rectangle: toRectangle(expandViewport(city.viewport, profile.cityRadiusMeters)),
+          rectangle: toRectangle(city.viewport),
         };
       } else if (profile.city && city?.location) {
         body.locationRestriction = {
@@ -765,7 +787,13 @@ function normalizeProfile(input = {}) {
     city: String(input.city ?? "").trim(),
     startTime: input.startTime || "10:00",
     stopCount: clamp(Number(input.stopCount ?? 4), 2, 12),
-    maxTransitMinutes: clamp(Number(input.maxTransitMinutes ?? 20), 5, 90),
+    maxTransitMinutes: clamp(
+      input.maxTransitHours
+        ? Math.round(Number(input.maxTransitHours) * 60)
+        : Number(input.maxTransitMinutes ?? 30),
+      5,
+      120,
+    ),
     minRating: clamp(Number(input.minRating ?? 4.5), 0, 5),
     mood: input.mood === "low" ? "low" : "high",
     tripStyle: normalizeTripStyle(input.tripStyle),
@@ -803,6 +831,7 @@ function normalizePlace(place) {
     name: place.displayName?.text ?? "Unnamed place",
     address: place.formattedAddress ?? "",
     location: place.location,
+    viewport: normalizeAnyViewport(place.viewport),
     rating: place.rating ?? 0,
     types: place.types ?? [],
     googleMapsUri: place.googleMapsUri ?? "",
@@ -864,6 +893,23 @@ function normalizeViewport(viewport) {
     south: Number(viewport.southwest.lat),
     west: Number(viewport.southwest.lng),
   };
+}
+
+function normalizeAnyViewport(viewport) {
+  // Geocoding returns {northeast:{lat,lng}, southwest:{lat,lng}}
+  const fromGeocode = normalizeViewport(viewport);
+  if (fromGeocode) return fromGeocode;
+
+  // Places may return {low:{latitude,longitude}, high:{latitude,longitude}}
+  if (viewport?.low && viewport?.high) {
+    const south = Number(viewport.low.latitude);
+    const west = Number(viewport.low.longitude);
+    const north = Number(viewport.high.latitude);
+    const east = Number(viewport.high.longitude);
+    if ([north, east, south, west].every(Number.isFinite)) return { north, east, south, west };
+  }
+
+  return null;
 }
 
 function requestedAreaTokens(inputCity, city) {
@@ -956,7 +1002,8 @@ function isInRequestedArea(place, profile, city) {
 
   // 1. If we have a viewport, use STRICT geographic containment
   if (city?.viewport) {
-    const inside = isInsideViewport(place.location, expandViewport(city.viewport, profile.cityRadiusMeters));
+    // Use the exact viewport bounds, no padding, to prevent leakage into neighboring cities
+    const inside = isInsideViewport(place.location, city.viewport);
     if (!inside) {
       // Hard reject — place is geographically outside the destination city
       return false;
@@ -1238,3 +1285,18 @@ async function loadDotEnv() {
     if (error.code !== "ENOENT") throw error;
   }
 }
+
+export {
+  handleApi,
+  createPlan,
+  resolveDestination,
+  geocodeDestination,
+  findCity,
+  searchInterestCandidates,
+  normalizeProfile,
+  normalizePlace,
+  normalizeAnyViewport,
+  viewportFromCenter,
+  toRectangle,
+  isInsideViewport,
+};
