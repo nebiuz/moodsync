@@ -1,0 +1,19 @@
+{
+  "name": "moodsync-travel-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MoodSync: a dynamic itinerary healer for time-crunched weekend explorers.",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "travel",
+    "google-maps",
+    "google-places",
+    "gemini",
+    "assistant"
+  ],
+  "license": "MIT"
+}
